@@ -424,7 +424,11 @@ class BNN:
         if timer: timer.stamp('bnn_end')
 
         val_loss = (np.sort(holdout_losses)[:self.num_elites]).mean()
+        max_logvar_op = tf.reduce_mean(self.max_logvar)
+        min_logvar_op = tf.reduce_mean(self.min_logvar)
+        max_logvar_val, min_logvar_val = self.sess.run([max_logvar_op, min_logvar_op])
         model_metrics = {'val_loss': val_loss}
+        model_metrics.update(max_logvar=max_logvar_val, min_logvar=min_logvar_val)
         print('[ BNN ] Holdout', np.sort(holdout_losses), model_metrics)
         return OrderedDict(model_metrics)
         # return np.sort(holdout_losses)[]

@@ -67,8 +67,11 @@ class MBPO(RLAlgorithm):
             rollout_batch_size=100e3,
             real_ratio=0.1,
             rollout_schedule=[20,100,1,1],
+            max_rollout_length=1,
             hidden_dim=200,
             max_model_t=None,
+            reward_penalty_coeff=1e-3,
+            stop_uncertain=False,
             **kwargs,
     ):
         """
@@ -101,7 +104,7 @@ class MBPO(RLAlgorithm):
         self._static_fns = static_fns
         self.fake_env = FakeEnv(self._model, self._static_fns)
 
-        self._rollout_schedule = rollout_schedule
+        self._max_rollout_length = max_rollout_length
         self._max_model_t = max_model_t
 
         # self._model_pool_size = model_pool_size
@@ -154,6 +157,9 @@ class MBPO(RLAlgorithm):
         self._observation_shape = observation_shape
         assert len(action_shape) == 1, action_shape
         self._action_shape = action_shape
+
+        self.reward_penalty_coeff = reward_penalty_coeff
+        self.stop_uncertain = stop_uncertain
 
         self._build()
 
@@ -335,18 +341,7 @@ class MBPO(RLAlgorithm):
         self._model.save(save_path, self._total_timestep)
 
     def _set_rollout_length(self):
-        min_epoch, max_epoch, min_length, max_length = self._rollout_schedule
-        if self._epoch <= min_epoch:
-            y = min_length
-        else:
-            dx = (self._epoch - min_epoch) / (max_epoch - min_epoch)
-            dx = min(dx, 1)
-            y = dx * (max_length - min_length) + min_length
-
-        self._rollout_length = int(y)
-        print('[ Model Length ] Epoch: {} (min: {}, max: {}) | Length: {} (min: {} , max: {})'.format(
-            self._epoch, min_epoch, max_epoch, self._rollout_length, min_length, max_length
-        ))
+        self._rollout_length = self._max_rollout_length
 
     def _reallocate_model_pool(self):
         obs_space = self._pool._observation_space
@@ -389,10 +384,25 @@ class MBPO(RLAlgorithm):
             act = self._policy.actions_np(obs)
             
             next_obs, rew, term, info = self.fake_env.step(obs, act, **kwargs)
-            steps_added.append(len(obs))
-
-            samples = {'observations': obs, 'actions': act, 'next_observations': next_obs, 'rewards': rew, 'terminals': term}
+            unc = info['uncertainties']
+            rew -= self.reward_penalty_coeff * unc
+            if self._rollout_length <= 1:
+                keep_ratio = 0.5
+            else:
+                keep_ratio = (self._max_rollout_length - i - 1) / (2 * (self._max_rollout_length + 1))
+            keep_num = int(len(obs) * keep_ratio)
+            indices = np.argsort(unc, axis=0)[:keep_num, 0]
+            steps_added.append(keep_num)
+            samples = {
+                'observations': obs[indices, :], 'actions': act[indices, :], 'next_observations': next_obs[indices, :],
+                'rewards': rew[indices, :], 'terminals': term[indices, :], 'uncertainties': unc[indices, :]
+            }
+            print('[ Uncertainties ] shape:{} min:{:.4f}, max:{:.4f}, mean:{:.4f}'.format(unc.shape, np.amin(unc), np.amax(unc), np.mean(unc)))
             self._model_pool.add_samples(samples)
+
+            if self.stop_uncertain:
+                next_obs = next_obs[indices, :]
+                term = term[indices, :]
 
             nonterm_mask = ~term.squeeze(-1)
             if nonterm_mask.sum() == 0:
