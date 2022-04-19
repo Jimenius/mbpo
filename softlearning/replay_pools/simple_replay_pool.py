@@ -169,3 +169,44 @@ class SimpleReplayPool(FlexibleReplayPool):
 
     def terminate_episode(self):
         pass
+
+
+class ModelReplayPool(SimpleReplayPool):
+    def __init__(self, observation_space, action_space, *args, **kwargs):
+        self._observation_space = observation_space
+        self._action_space = action_space
+
+        observation_fields = normalize_observation_fields(observation_space)
+        # It's a bit memory inefficient to save the observations twice,
+        # but it makes the code *much* easier since you no longer have
+        # to worry about termination conditions.
+        observation_fields.update({
+            'next_' + key: value
+            for key, value in observation_fields.items()
+        })
+
+        fields = {
+            **observation_fields,
+            **{
+                'actions': {
+                    'shape': self._action_space.shape,
+                    'dtype': 'float32'
+                },
+                'rewards': {
+                    'shape': (1, ),
+                    'dtype': 'float32'
+                },
+                # self.terminals[i] = a terminal was received at time i
+                'terminals': {
+                    'shape': (1, ),
+                    'dtype': 'bool'
+                },
+
+                'uncertainties': {
+                    'shape': (1, ),
+                    'dtype': 'float32'
+                }
+            }
+        }
+
+        FlexibleReplayPool.__init__(self, *args, fields_attrs=fields, **kwargs)

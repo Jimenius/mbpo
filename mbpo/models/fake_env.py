@@ -30,6 +30,11 @@ class FakeEnv:
 
         return log_prob, stds
 
+    def _get_kl(self, mean1, std1, mean2, std2):
+        var_ratio = np.square(std1 / std2)
+        t1 = np.square((mean1 - mean2) / std2)
+        return 0.5 * (var_ratio + t1 - 1. - np.log(var_ratio)).sum(1, keepdims=True)
+
     def step(self, obs, act, deterministic=False):
         assert len(obs.shape) == len(act.shape)
         if len(obs.shape) == 1:
@@ -56,7 +61,14 @@ class FakeEnv:
         samples = ensemble_samples[model_inds, batch_inds]
         model_means = ensemble_model_means[model_inds, batch_inds]
         model_stds = ensemble_model_stds[model_inds, batch_inds]
+        model_vars = np.square(model_stds)
         ####
+
+        rest_means = (np.sum(ensemble_model_means, axis=0) - model_means) / (num_models - 1)
+        rest_vars = (np.sum(ensemble_model_vars + np.square(ensemble_model_means), axis=0) - \
+                    np.square(model_means) - model_vars) / (num_models - 1) - np.square(rest_means)
+        rest_stds = np.sqrt(rest_vars)
+        uncertainties = self._get_kl(model_means, model_stds, rest_means, rest_stds)
 
         log_prob, dev = self._get_logprob(samples, ensemble_model_means, ensemble_model_vars)
 
@@ -74,7 +86,7 @@ class FakeEnv:
             rewards = rewards[0]
             terminals = terminals[0]
 
-        info = {'mean': return_means, 'std': return_stds, 'log_prob': log_prob, 'dev': dev}
+        info = {'mean': return_means, 'std': return_stds, 'log_prob': log_prob, 'dev': dev, 'uncertainties': uncertainties}
         return next_obs, rewards, terminals, info
 
     ## for debugging computation graph

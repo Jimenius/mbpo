@@ -14,7 +14,7 @@ import tensorflow as tf
 from tensorflow.python.training import training_util
 
 from softlearning.algorithms.rl_algorithm import RLAlgorithm
-from softlearning.replay_pools.simple_replay_pool import SimpleReplayPool
+from softlearning.replay_pools.simple_replay_pool import ModelReplayPool
 
 from mbpo.models.constructor import construct_model, format_samples_for_training
 from mbpo.models.fake_env import FakeEnv
@@ -360,14 +360,14 @@ class MBPO(RLAlgorithm):
             print('[ MBPO ] Initializing new model pool with size {:.2e}'.format(
                 new_pool_size
             ))
-            self._model_pool = SimpleReplayPool(obs_space, act_space, new_pool_size)
+            self._model_pool = ModelReplayPool(obs_space, act_space, new_pool_size)
         
         elif self._model_pool._max_size != new_pool_size:
             print('[ MBPO ] Updating model pool | {:.2e} --> {:.2e}'.format(
                 self._model_pool._max_size, new_pool_size
             ))
             samples = self._model_pool.return_all_samples()
-            new_pool = SimpleReplayPool(obs_space, act_space, new_pool_size)
+            new_pool = ModelReplayPool(obs_space, act_space, new_pool_size)
             new_pool.add_samples(samples)
             assert self._model_pool.size == new_pool.size
             self._model_pool = new_pool
@@ -385,13 +385,16 @@ class MBPO(RLAlgorithm):
         batch = self.sampler.random_batch(rollout_batch_size)
         obs = batch['observations']
         steps_added = []
+        self.min_uncertainty = float('inf')
         for i in range(self._rollout_length):
             act = self._policy.actions_np(obs)
             
             next_obs, rew, term, info = self.fake_env.step(obs, act, **kwargs)
+            unc = info['uncertainties']
+            self.min_uncertainty = min(self.min_uncertainty, np.amin(unc))
             steps_added.append(len(obs))
-
-            samples = {'observations': obs, 'actions': act, 'next_observations': next_obs, 'rewards': rew, 'terminals': term}
+            samples = {'observations': obs, 'actions': act, 'next_observations': next_obs, 'rewards': rew, 'terminals': term, 'uncertainties': unc}
+            print('[ Uncertainties ] shape:{} min:{:.4f}, max:{:.4f}, mean:{:.4f}'.format(unc.shape, np.amin(unc), np.amax(unc), np.mean(unc)))
             self._model_pool.add_samples(samples)
 
             nonterm_mask = ~term.squeeze(-1)
@@ -402,7 +405,7 @@ class MBPO(RLAlgorithm):
             obs = next_obs[nonterm_mask]
 
         mean_rollout_length = sum(steps_added) / rollout_batch_size
-        rollout_stats = {'mean_rollout_length': mean_rollout_length}
+        rollout_stats = {'mean_rollout_length': mean_rollout_length, 'ref_uncertainty': self.min_uncertainty}
         print('[ Model Rollout ] Added: {:.1e} | Model pool: {:.1e} (max {:.1e}) | Length: {} | Train rep: {}'.format(
             sum(steps_added), self._model_pool.size, self._model_pool._max_size, mean_rollout_length, self._n_train_repeat
         ))
@@ -428,9 +431,21 @@ class MBPO(RLAlgorithm):
 
         ## can sample from the env pool even if env_batch_size == 0
         env_batch = self._pool.random_batch(env_batch_size)
+        env_batch.update(
+            weights=np.ones((env_batch_size, 1), dtype=np.float32)
+        )
 
         if model_batch_size > 0:
             model_batch = self._model_pool.random_batch(model_batch_size)
+            unc = model_batch.get(
+                'uncertainties',
+                np.ones(
+                    (model_batch_size, 1),
+                    dtype=np.float32,
+                ) * self.min_uncertainty,
+            )
+            weights = np.clip(self.min_uncertainty / unc, 0, 1)
+            model_batch.update(weights=weights)
 
             keys = env_batch.keys()
             batch = {k: np.concatenate((env_batch[k], model_batch[k]), axis=0) for k in keys}
@@ -489,6 +504,12 @@ class MBPO(RLAlgorithm):
             name='terminals',
         )
 
+        self._weights_ph = tf.placeholder(
+            tf.float32,
+            shape=(None, 1),
+            name='weights',
+        )
+
         if self._store_extra_policy_info:
             self._log_pis_ph = tf.placeholder(
                 tf.float32,
@@ -537,7 +558,8 @@ class MBPO(RLAlgorithm):
 
         Q_losses = self._Q_losses = tuple(
             tf.losses.mean_squared_error(
-                labels=Q_target, predictions=Q_value, weights=0.5)
+                # labels=Q_target, predictions=Q_value, weights=0.5*self._weights_ph)
+                labels=Q_target, predictions=Q_value, weights=self._weights_ph)
             for Q_value in Q_values)
 
         self._Q_optimizers = tuple(
@@ -673,6 +695,7 @@ class MBPO(RLAlgorithm):
             self._next_observations_ph: batch['next_observations'],
             self._rewards_ph: batch['rewards'],
             self._terminals_ph: batch['terminals'],
+            self._weights_ph: batch['weights']
         }
 
         if self._store_extra_policy_info:
